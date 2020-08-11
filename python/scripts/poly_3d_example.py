@@ -3,6 +3,7 @@
 
 import numpy as np
 from traj_gen import poly_trajectory as pt
+# from traj_gen import poly_trajectory_qp as pt
 import time
 
 if __name__ == '__main__':

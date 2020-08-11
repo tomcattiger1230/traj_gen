@@ -3,12 +3,13 @@
 
 from .traj_gen_base import TrajGen
 import numpy as np
-import casadi as ca
 from scipy.linalg import block_diag, solve
+from qpsolvers import solve_qp
 
 
 class PolyTrajGen(TrajGen):
     def __init__(self, knots_, order_, algo_, dim_, maxContiOrder_):
+        """ Initialize the class of the trajectory generator"""
         super().__init__(knots_, dim_)
         self.N = order_ # polynomial order
         self.algorithm = algo_
@@ -47,11 +48,6 @@ class PolyTrajGen(TrajGen):
             self.weight_mask = weights
 
     def addPin(self, pin_):
-        """
-        add pin in the trajectory
-        Args:
-            pin_(dict): fix/loose pin during the trajectory
-        """
         t_ = pin_['t']
         X_ = pin_['X']
         super().addPin(pin_)
@@ -87,7 +83,7 @@ class PolyTrajGen(TrajGen):
             d(int): order derivative
 
         Returns:
-        val_: n-th ceoffs
+            val_: n-th ceoffs
         """
         if d == 0:
             val_ = 1
@@ -111,22 +107,11 @@ class PolyTrajGen(TrajGen):
             print("Order of derivative > poly order, return zeros-matrix \n")
         for i in range(d, self.N+1):
             for j in range(d, self.N+1):
-<<<<<<< HEAD
                 # if i+j-2*d+1 > 0:
-                mat_[i,j] = 2*self.nthCeoff(i, d) * self.nthCeoff(j, d) / (i+j-2*d+1)
-=======
                 mat_[i,j] = self.nthCeoff(i, d) * self.nthCeoff(j, d) / (i+j-2*d+1)
->>>>>>> develop
         return mat_
 
     def findSegInteval(self, t_):
-        """ find the segment index of the given time
-        Args:
-            t_(double): time
-        Returns:
-            m_(int): segment index
-            tau_(double): the normalized result in the estimated segment
-        """
         idx_ = np.where(self.Ts<=t_)[0]
         if idx_.shape[0]>0:
             m_ = np.max(idx_)
@@ -141,13 +126,7 @@ class PolyTrajGen(TrajGen):
         return m_, tau_
 
     def tVec(self, t_, d_):
-        """ time vector evaluated at time t with d-th order derivative.
-        Args:
-            t_(double): time
-            d_(double): derivative
-        Returns:
-            vec_(array): time vector
-        """
+        # time vector evaluated at time t with d-th order derivative.
         vec_ = np.zeros((self.N+1, 1))
         for i in range(d_, self.N+1):
             vec_[i] = self.nthCeoff(i, d_)*t_**(i-d_)
@@ -185,7 +164,7 @@ class PolyTrajGen(TrajGen):
         dTm2_ = self.Ts[m_+2] - self.Ts[m_+1]
         for d in range(dmax_+1):
             # the end of the first segment should be the same as the begin of the next segment at each derivative
-            aeq_[d, idxStart_:idxEnd_] = np.concatenate((self.tVec(1, d)/dTm1_**d, - self.tVec(0, d)/dTm2_**d), axis=0).flatten()
+            aeq_[d, idxStart_:idxEnd_] = np.concatenate((self.tVec(1, d)/dTm1_**d, - self.tVec(0, d)/dTm2_**d), axis=0).flatten() #
 
         return aeq_, beq_
 
@@ -222,13 +201,14 @@ class PolyTrajGen(TrajGen):
                         else:
                             Qd_ = block_diag(Qd_, Q_m_)
                     Q_ = Q_ + self.weight_mask[d-1]*Qd_
-            QSet[dd] = Q_.copy()
+            QSet[dd] = Q_
 
         # constraint
         AeqSet = None
         ASet = None
         BSet = None
         BeqSet = None
+
         for m in range(self.M): # segments
             ## fix pin
             if m in self.fixPinSet.keys():
@@ -239,7 +219,7 @@ class PolyTrajGen(TrajGen):
                         BeqSet = beqSet.reshape(self.dim, -1, 1)
                     else:
                         AeqSet = np.concatenate((AeqSet, aeqSet.reshape(self.dim, -1, self.num_variables)), axis=1)
-                        BeqSet = np.concatenate((BeqSet, beqSet.reshape(self.dim, 1, -1)), axis=1)
+                        BeqSet = np.concatenate((BeqSet, beqSet.reshape(self.dim, -1, 1)), axis=1)
 
                 ## continuity
                 if m < self.M-1:
@@ -249,8 +229,8 @@ class PolyTrajGen(TrajGen):
                         print('Connecting segment ({0},{1}) : lacks {2} dof  for imposed {3} th continuity'.format(m, m+1, self.maxContiOrder-contiDof_, self.maxContiOrder))
                     if contiDof_ >0:
                         aeq, beq = self.contiMat(m, contiDof_-1)
-                        AeqSet = np.concatenate((AeqSet, aeq.reshape(1, -1, self.num_variables).repeat(3, axis=0)), axis=1)
-                        BeqSet = np.concatenate((BeqSet, beq.reshape(1, -1, 1).repeat(3, axis=0)), axis=1)
+                        AeqSet = np.concatenate((AeqSet, aeq.reshape(1, -1, self.num_variables).repeat(self.dim, axis=0)), axis=1)
+                        BeqSet = np.concatenate((BeqSet, beq.reshape(1, -1, 1).repeat(self.dim, axis=0)), axis=1)
             else:
                 pass # not pin in this interval
 
@@ -277,6 +257,7 @@ class PolyTrajGen(TrajGen):
             freeOrder = freePinOrder_[:int(dof_)]
             for order in freeOrder:
                 virtualPin_ = {'t':self.Ts[m], 'X':np.zeros((self.dim, 1)), 'd':order}
+                # print('virtual Pin {}'.format(virtualPin_))
                 aeqSet_, _ = self.fixPinMatSet(virtualPin_)
                 aeq_ = aeqSet_[0] # only one dim is taken.
                 mapMat_ = np.concatenate((mapMat_, aeq_.reshape(-1, self.num_variables)), axis=0)
@@ -327,80 +308,71 @@ class PolyTrajGen(TrajGen):
             mapMat = self.coeff2endDerivatives(AeqSet[0])
             QSet, HSet, ASet, BSet, dp_e = self.mapQP(QSet, ASet, BSet, AeqSet, BeqSet)
         elif self.algorithm == 'poly-coeff': # or ASet is None:
-            x_sym = ca.SX.sym('x', QSet[0].shape[0])
-            opts_setting = {'ipopt.max_iter':100, 'ipopt.print_level':0, 'print_time':0, 'ipopt.acceptable_tol':1e-8, 'ipopt.acceptable_obj_change_tol':1e-6}
-
-        else:
-            print('unsupported algorithm')
+            pass
 
         for dd in range(self.dim):
             print('soving {}th dimension ...'.format(dd))
             if self.algorithm == 'poly-coeff': # or ASet is None:
-                obj = ca.mtimes([x_sym.T, QSet[dd], x_sym])
-                if ASet is not None:
-                    a_set = np.concatenate((ASet[dd], AeqSet[dd]))
-                else:
-                    a_set = AeqSet[dd].copy()
-                Ax_sym = ca.mtimes([a_set, x_sym])
-                if BSet is not None:
-                    b_set_u = np.concatenate((BSet[dd], BeqSet[dd])) # Ax <= b_set_u
-                    b_set_l = np.concatenate((-np.inf*np.ones(BSet[dd].shape), BeqSet[dd])) # Ax >= b_set_l
-                else:
-                    b_set_u = BeqSet[dd]
-                    b_set_l = BeqSet[dd]
-                nlp_prob = {'f': obj, 'x': x_sym, 'g':Ax_sym}
-                solver = ca.nlpsol('solver', 'ipopt', nlp_prob, opts_setting)
+                # if ASet is not None:
+                #     a_set = np.concatenate((ASet[dd], AeqSet[dd]))
+                # else:
+                #     a_set = AeqSet[dd].copy()
+                # # Ax_sym = ca.mtimes([a_set, x_sym])
+                # if BSet is not None:
+                #     b_set_u = np.concatenate((BSet[dd], BeqSet[dd])) # Ax <= b_set_u
+                #     b_set_l = np.concatenate((-np.inf*np.ones(BSet[dd].shape), BeqSet[dd])) # Ax >= b_set_l
+                # else:
+                #     b_set_u = BeqSet[dd]
+                #     b_set_l = BeqSet[dd]
                 try:
-                    result = solver(lbg=b_set_l, ubg=b_set_u,)
-                    Phat_ = result['x']
-                    flag_ = True
+                    if ASet is not None:
+                        result = solve_qp(P=QSet[dd], q=np.zeros((QSet[dd].shape[0])), G=ASet[dd],
+                        h=BSet[dd], A=AeqSet[dd], b=BeqSet[dd], solver='cvxopt')
+                    else:
+                        if dd == 3:
+                            print(BeqSet[dd].shape)
+                        result = solve_qp(P=QSet[dd], q=np.zeros((QSet[dd].shape[0])), A=AeqSet[dd], b=BeqSet[dd], solver='cvxopt')
+                    Phat_ = result
+                    if Phat_ is not None:
+                        flag_ = True
+                    else:
+                        flag_ = False
                 except:
                     Phat_ = None
                     flag_ = False
             else: # using end-derivative method
                 if ASet is not None:
-                    ## qpoases version
-                    qp = {}
-                    qp['h'] = ca.DM(QSet[dd]).sparsity()
-                    qp['a'] = ca.DM(ASet[dd]).sparsity()
+                    result = solve_qp(P=QSet[dd], q=HSet[dd], G=ASet[dd],
+                        h=BSet[dd], solver='cvxopt')
+                    dP_ = result.reshape(-1, 1)
+                    dF_ = BeqSet[dd]
+                    Phat_ = solve(mapMat, np.concatenate((dF_, dP_)))
 
-                    options_ = {'print_time':False, "jit":True, 'verbose':False, 'print_problem':False,}
-                    solver_ = ca.conic('solver_', 'qpoases', qp, options_)
-                    try:
-                        result = solver_(h=QSet[dd], g=HSet[dd], a=ASet[dd], uba=BSet[dd])
-                        dP_ = result['x']
-                        dF_ = BeqSet[dd]
-                        Phat_ = solve(mapMat, np.concatenate((dF_, dP_)))
-
-                        flag_ = True
-                    except:
-                        dP_ = None
-                        flag_ = False
+                    flag_ = True
                 else:
                     # without considering the optimization problem, get the result directly
                     dP_ = dp_e.copy()
                     dF_ = BeqSet[dd]
                     Phat_ = solve(mapMat, np.concatenate((dF_, dP_[dd].reshape(-1, 1))))
                     flag_ = True
+                #     options_ = {'print_time':False, "jit":True, 'verbose':False, 'print_problem':False,}
+                #     solver_ = ca.conic('solver_', 'qpoases', qp, options_)
+                #     try:
+                #         result = solver_(h=QSet[dd], g=HSet[dd], a=ASet[dd], uba=BSet[dd])
+                #         dP_ = result['x']
+                #         dF_ = BeqSet[dd]
+                #         Phat_ = solve(mapMat, np.concatenate((dF_, dP_)))
 
-                # ## ipopt version [this is an alternative choice to solve the opt problem, however it is slower than the sigle qp problem]
-                # x_sym = ca.SX.sym('x', QSet[0].shape[0])
-                # opts_setting = {'ipopt.max_iter':100, 'ipopt.print_level':0, 'print_time':0, 'ipopt.acceptable_tol':1e-8, 'ipopt.acceptable_obj_change_tol':1e-6}
-                # print(HSet[dd].shape)
-                # obj = 0.5* ca.mtimes([x_sym.T, QSet[dd], x_sym]) + ca.mtimes([HSet[dd].reshape(1, -1), x_sym])
-                # Ax_sym = ca.mtimes([ASet[dd], x_sym])
-                # nlp_prob = {'f': obj, 'x': x_sym, 'g':Ax_sym}
-                # solver = ca.nlpsol('solver', 'ipopt', nlp_prob, opts_setting)
-                # try:
-                #     result = solver(ubg=BSet[dd],)
-                #     dP_ = result['x']
-                #     # print(dP_)
+                #         flag_ = True
+                #     except:
+                #         dP_ = None
+                #         flag_ = False
+                # else:
+                #     # without considering the optimization problem, get the result directly
+                #     dP_ = dp_e.copy()
                 #     dF_ = BeqSet[dd]
-                #     Phat_ = solve(mapMat, np.concatenate((dF_, dP_)))
+                #     Phat_ = solve(mapMat, np.concatenate((dF_, dP_[dd].reshape(-1, 1))))
                 #     flag_ = True
-                # except:
-                #     dP_ = None
-                #     flag_ = False
             if flag_:
                 print("success !")
                 # print('phat shape: {}'.format(Phat_.shape))
