@@ -5,4 +5,8 @@ Python Implementation for Trajectory Generator.
 
 - Python 3.8, it should work up at least Python 3.5
 - CasADi v3.5.1, for solving QP/OP
+- for the version using **poly_trajectory_qp**, one needs to install qpsolvers by
+    ```bash
+        pip install qpsolvers cvxopt
+    ```
 
