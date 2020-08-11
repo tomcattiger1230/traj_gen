@@ -111,12 +111,7 @@ class PolyTrajGen(TrajGen):
             print("Order of derivative > poly order, return zeros-matrix \n")
         for i in range(d, self.N+1):
             for j in range(d, self.N+1):
-<<<<<<< HEAD
-                # if i+j-2*d+1 > 0:
-                mat_[i,j] = 2*self.nthCeoff(i, d) * self.nthCeoff(j, d) / (i+j-2*d+1)
-=======
                 mat_[i,j] = self.nthCeoff(i, d) * self.nthCeoff(j, d) / (i+j-2*d+1)
->>>>>>> develop
         return mat_
 
     def findSegInteval(self, t_):
