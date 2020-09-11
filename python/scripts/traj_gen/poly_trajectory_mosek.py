@@ -1,14 +1,26 @@
 #!/usr/bin/env python
 # coding=utf-8
-
+'''
+Author: Wei Luo
+Date: 2020-08-21 18:02:38
+LastEditors: Wei Luo
+LastEditTime: 2020-08-31 13:53:51
+Note: Note
+'''
 from .traj_gen_base import TrajGen
 import numpy as np
-import casadi as ca
 from scipy.linalg import block_diag, solve
+import mosek as mk
+import mosek.fusion as mkfs
+from qpsolvers import solve_qp
+import sys
+import casadi as ca
+import time
 
 
 class PolyTrajGen(TrajGen):
     def __init__(self, knots_, order_, algo_, dim_, maxContiOrder_):
+        """ Initialize the class of the trajectory generator"""
         super().__init__(knots_, dim_)
         self.N = order_ # polynomial order
         self.algorithm = algo_
@@ -16,6 +28,7 @@ class PolyTrajGen(TrajGen):
         self.M = knots_.shape[0] - 1 # segments which is knots - 1
         self.maxContiOrder = maxContiOrder_
         self.num_variables =  (self.N+1) * self.M
+        self.inf = np.inf
         self.segState = np.zeros((self.M, 2)) # 0 dim -> how many fixed pins in this segment,
                                               # muss smaller than the polynomial order+1
                                               # more fixed pins (higher order) will be ignored.
@@ -47,11 +60,6 @@ class PolyTrajGen(TrajGen):
             self.weight_mask = weights
 
     def addPin(self, pin_):
-        """
-        add pin in the trajectory
-        Args:
-            pin_(dict): fix/loose pin during the trajectory
-        """
         t_ = pin_['t']
         X_ = pin_['X']
         super().addPin(pin_)
@@ -87,7 +95,7 @@ class PolyTrajGen(TrajGen):
             d(int): order derivative
 
         Returns:
-        val_: n-th ceoffs
+            val_: n-th ceoffs
         """
         if d == 0:
             val_ = 1
@@ -109,10 +117,6 @@ class PolyTrajGen(TrajGen):
         mat_ = np.zeros((self.N+1, self.N+1))
         if d > self.N:
             print("Order of derivative > poly order, return zeros-matrix \n")
-        # for i in range(self.N+1):
-        #     for j in range(self.N+1):
-        #         if i+j-2*d+1 > 0:
-        #             mat_[i,j] = self.nthCeoff(i, d) * self.nthCeoff(j, d) / (i+j-2*d+1)
         for i in range(d, self.N+1):
             for j in range(d, self.N+1):
                 # if i+j-2*d+1 > 0:
@@ -120,13 +124,6 @@ class PolyTrajGen(TrajGen):
         return mat_
 
     def findSegInteval(self, t_):
-        """ find the segment index of the given time
-        Args:
-            t_(double): time
-        Returns:
-            m_(int): segment index
-            tau_(double): the normalized result in the estimated segment
-        """
         idx_ = np.where(self.Ts<=t_)[0]
         if idx_.shape[0]>0:
             m_ = np.max(idx_)
@@ -141,13 +138,7 @@ class PolyTrajGen(TrajGen):
         return m_, tau_
 
     def tVec(self, t_, d_):
-        """ time vector evaluated at time t with d-th order derivative.
-        Args:
-            t_(double): time
-            d_(double): derivative
-        Returns:
-            vec_(array): time vector
-        """
+        # time vector evaluated at time t with d-th order derivative.
         vec_ = np.zeros((self.N+1, 1))
         for i in range(d_, self.N+1):
             vec_[i] = self.nthCeoff(i, d_)*t_**(i-d_)
@@ -222,7 +213,7 @@ class PolyTrajGen(TrajGen):
                         else:
                             Qd_ = block_diag(Qd_, Q_m_)
                     Q_ = Q_ + self.weight_mask[d-1]*Qd_
-            QSet[dd] = Q_.copy()
+            QSet[dd] = Q_
 
         # constraint
         AeqSet = None
@@ -240,7 +231,7 @@ class PolyTrajGen(TrajGen):
                         BeqSet = beqSet.reshape(self.dim, -1, 1)
                     else:
                         AeqSet = np.concatenate((AeqSet, aeqSet.reshape(self.dim, -1, self.num_variables)), axis=1)
-                        BeqSet = np.concatenate((BeqSet, beqSet.reshape(self.dim, 1, -1)), axis=1)
+                        BeqSet = np.concatenate((BeqSet, beqSet.reshape(self.dim, -1, 1)), axis=1)
 
                 ## continuity
                 if m < self.M-1:
@@ -250,8 +241,8 @@ class PolyTrajGen(TrajGen):
                         print('Connecting segment ({0},{1}) : lacks {2} dof  for imposed {3} th continuity'.format(m, m+1, self.maxContiOrder-contiDof_, self.maxContiOrder))
                     if contiDof_ >0:
                         aeq, beq = self.contiMat(m, contiDof_-1)
-                        AeqSet = np.concatenate((AeqSet, aeq.reshape(1, -1, self.num_variables).repeat(3, axis=0)), axis=1)
-                        BeqSet = np.concatenate((BeqSet, beq.reshape(1, -1, 1).repeat(3, axis=0)), axis=1)
+                        AeqSet = np.concatenate((AeqSet, aeq.reshape(1, -1, self.num_variables).repeat(self.dim, axis=0)), axis=1)
+                        BeqSet = np.concatenate((BeqSet, beq.reshape(1, -1, 1).repeat(self.dim, axis=0)), axis=1)
             else:
                 pass # not pin in this interval
 
@@ -318,77 +309,233 @@ class PolyTrajGen(TrajGen):
 
         return QSet, HSet, ASet, BSet, dp_
 
+    def qp_mk_solver(self, P, q=None, G=None, h=None, A=None, b=None, lb=None, ub=None):
+        '''
+        description:
+            using MOSEK to solve a qp problem
+        param {type}
+        return {type}
+        '''
+        num_x = P.shape[0]
+        num_c = 0
+
+        bound_key_cons = []
+        bound_low_cons = []
+        bound_up_cons = []
+
+        A_sum = None
+        xx = None
+        # print('solving using mosek')
+
+        ## only for print optimizer states
+        # def streamprinter(text):
+        #     sys.stdout.write(text + '\n')
+        #     sys.stdout.flush()
+        # prepare data
+        num_x = P.shape[0]
+        if lb is None and ub is None:
+            bound_low_x = [-self.inf]*num_x
+            bound_up_x = [self.inf]*num_x
+            bound_key_x = [mk.boundkey.fr]*num_x
+        elif lb is None and ub is not None:
+            bound_key_x = [mk.boundkey.up]*num_x
+        elif lb is not None and ub is None:
+            bound_key_x = [mk.boundkey.lo]*num_x
+        else:
+            bound_key_x = [mk.boundkey.ra]*num_x
+        if G is not None:
+            num_c += G.shape[0]
+            bound_key_cons = bound_key_cons + [mk.boundkey.up]*G.shape[0]
+            bound_low_cons = bound_low_cons + [-np.inf]*G.shape[0]
+            bound_up_cons = bound_up_cons + h.flatten().tolist()
+            if A_sum is None:
+                A_sum = G
+            else:
+                A_sum = np.concatenate((A_sum, G))
+        if A is not None:
+            num_c += A.shape[0]
+            bound_key_cons = bound_key_cons + [mk.boundkey.fx]*A.shape[0]
+            bound_low_cons = bound_low_cons + b.flatten().tolist()
+            bound_up_cons = bound_up_cons + b.flatten().tolist()
+            if A_sum is None:
+                A_sum = A
+            else:
+                A_sum = np.concatenate((A_sum, A))
+
+        with mk.Env() as env:
+            with env.Task(0, 0) as task:
+                # task.set_Stream(mk.streamtype.log, streamprinter) # for print solver information
+                task.appendvars(num_x)
+                for i in range(num_x):
+                    task.putvarbound(i, bound_key_x[i], bound_low_x[i], bound_up_x[i])
+                if q is not None:
+                    for i in range(num_x):
+                        task.putcj(i, q[i]) # add q vector
+                for i in range(num_x):
+                    for j in range(num_x):
+                        if j <= i: # only the lower triangle matrix needs to be defined
+                            task.putqobjij(i, j, P[i, j])
+
+                task.appendcons(num_c)
+                for i in range(num_c):
+                    task.putconbound(i, bound_key_cons[i], bound_low_cons[i], bound_up_cons[i])
+                for i in range(num_c):
+                    for j in range(num_x):
+                        task.putaij(i, j, A_sum[i, j])
+                        # task.putaij(i, j, A[i, j])
+                task.putobjsense(mk.objsense.minimize)
+                task.optimize()
+                # task.solutionsummary(mk.streamtype.msg)
+                prosta = task.getprosta(mk.soltype.itr)
+                solsta = task.getsolsta(mk.soltype.itr)
+                xx = [0.]*num_x
+                task.getxx(mk.soltype.itr, xx)
+                if solsta == mk.solsta.optimal:
+                    print("Optimal solution found.")
+                elif solsta == mk.solsta.dual_infeas_cer:
+                    print("Primal or dual infeasibility.\n")
+                elif solsta == mk.solsta.prim_infeas_cer:
+                    print("Primal or dual infeasibility.\n")
+                elif mk.solsta.unknown:
+                    print("Unknown solution status")
+                else:
+                    print("Other solution status")
+
+        return xx
+
+    def qp_mk_fusion_solver(self, P, q=None, G=None, h=None, A=None, b=None, lb=None, ub=None):
+        '''
+        description:
+        param {type}
+        return {type}
+        '''
+        num_x = P.shape[0]
+        num_c_eq = 0
+        xx = None
+        print('solving using mosek fusion')
+
+        ## only for print optimizer states
+        # def streamprinter(text):
+        #     sys.stdout.write(text + '\n')
+        #     sys.stdout.flush()
+        # prepare data
+        if G is not None:
+            num_c_ieq = G.shape[0]
+
+        if A is not None:
+            num_c_eq = A.shape[0]
+
+        with mkfs.Model('test') as M:
+            x = M.variable('x', num_x, mkfs.Domain.unbounded())
+            t_0 = M.variable('t0', 1, mkfs.Domain.unbounded())
+            # F_chol, d, _ = ldl(P, lower=True)
+            try:
+                F_chol = np.linalg.cholesky(P)
+            except:
+                F_chol =np.linalg.cholesky(P+np.diag(np.ones(P.shape[0]))*1e-7)
+            # result of the cholesky decomposition
+            F_ = M.parameter('F', [num_x, num_x])
+            # set up value of the mksf parameter
+            F_.setValue(F_chol.T)
+            quad_cost = mkfs.Expr.vstack(t_0, mkfs.Expr.mul(F_, x))
+            M.constraint("lc", quad_cost, mkfs.Domain.inQCone())
+
+            if A is not None:
+                A_ = M.parameter('A', [num_c_eq, num_x])
+                b_ = M.parameter('b', num_c_eq)
+                A_.setValue(A)
+                b_.setValue(b.flatten())
+                M.constraint(mkfs.Expr.sub(mkfs.Expr.mul(A_, x), b_), mkfs.Domain.equalsTo(0.0))
+            if G is not None:
+                A_ieq_ = M.parameter('A_ieq', [num_c_ieq, num_x])
+                b_ieq_ = M.parameter('b_ieq', num_c_ieq)
+                A_ieq_.setValue(G)
+                b_ieq_.setValue(h.flatten())
+                M.constraint(mkfs.Expr.sub(mkfs.Expr.mul(A_ieq_, x), b_ieq_), mkfs.Domain.lessThan(0.0))
+
+            M.objective('obj', mkfs.ObjectiveSense.Minimize, t_0)
+            t1 = time.time()
+            M.solve()
+            sol_x = x.level()
+            return sol_x
 
     def solve(self,):
         self.isSolved = True
         # prepare QP
         QSet, ASet, BSet, AeqSet, BeqSet = self.getQPset()
 
-
         if self.algorithm == 'end-derivative':# and ASet is not None:
             mapMat = self.coeff2endDerivatives(AeqSet[0])
             QSet, HSet, ASet, BSet, dp_e = self.mapQP(QSet, ASet, BSet, AeqSet, BeqSet)
         elif self.algorithm == 'poly-coeff': # or ASet is None:
-            x_sym = ca.SX.sym('x', QSet[0].shape[0])
-            opts_setting = {'ipopt.max_iter':100, 'ipopt.print_level':0, 'print_time':0, 'ipopt.acceptable_tol':1e-8, 'ipopt.acceptable_obj_change_tol':1e-6}
-
-        else:
-            print('unsupported algorithm')
+            pass
 
         for dd in range(self.dim):
             print('soving {}th dimension ...'.format(dd))
             if self.algorithm == 'poly-coeff': # or ASet is None:
-                obj = ca.mtimes([x_sym.T, QSet[dd], x_sym])
-                if ASet is not None:
-                    a_set = np.concatenate((ASet[dd], AeqSet[dd]))
-                else:
-                    a_set = AeqSet[dd].copy()
-                Ax_sym = ca.mtimes([a_set, x_sym])
-                if BSet is not None:
-                    b_set_u = np.concatenate((BSet[dd], BeqSet[dd])) # Ax <= b_set_u
-                    b_set_l = np.concatenate((-np.inf*np.ones(BSet[dd].shape), BeqSet[dd])) # Ax >= b_set_l
-                else:
-                    b_set_u = BeqSet[dd]
-                    b_set_l = BeqSet[dd]
-                nlp_prob = {'f': obj, 'x': x_sym, 'g':Ax_sym}
-                solver = ca.nlpsol('solver', 'ipopt', nlp_prob, opts_setting)
                 try:
-                    result = solver(lbg=b_set_l, ubg=b_set_u,)
-                    Phat_ = result['x']
-                    flag_ = True
+                    if ASet is not None:
+                        t1 = time.time()
+                        result = solve_qp(P=QSet[dd], q=np.zeros((QSet[dd].shape[0])), G=ASet[dd],
+                            h=BSet[dd], A=AeqSet[dd], b=BeqSet[dd], solver='cvxopt')
+                        print("solve qp time {}".format(time.time() - t1))
+                        t2 = time.time()
+                        result = self.qp_mk_solver(P=QSet[dd], G=ASet[dd], h=BSet[dd], A=AeqSet[dd], b=BeqSet[dd])
+                        print("mosek using api {0}".format(time.time() - t2))
+                        t3 = time.time()
+                        result = self.qp_mk_fusion_solver(P=QSet[dd], G=ASet[dd], h=BSet[dd], A=AeqSet[dd], b=BeqSet[dd])
+                        print("mosek using fusion {0}".format(time.time() - t3))
+                        # print("result qpsolver {0} \n and result mosek {1}".format(result, result_test))
+                    else:
+                        if dd == 3:
+                            print(BeqSet[dd].shape)
+                        # print(QSet[dd].shape)
+                        # t1 = time.time()
+                        result = solve_qp(P=QSet[dd], q=np.zeros((QSet[dd].shape[0])), A=AeqSet[dd], b=BeqSet[dd], solver='cvxopt')
+                        # print(time.time() - t1)
+                        # t2 = time.time()
+                        result = self.qp_mk_solver(P=QSet[dd], A=AeqSet[dd], b=BeqSet[dd])
+                        result = self.qp_mk_fusion_solver(P=QSet[dd], A=AeqSet[dd], b=BeqSet[dd])
+                        print(result)
+                        # print("saving")
+                        # np.savetxt("P_"+str(dd)+".csv", QSet[dd], delimiter=",")
+                        # np.savetxt("A_"+str(dd)+".csv", AeqSet[dd], delimiter=",")
+                        # np.savetxt("B_"+str(dd)+".csv", BeqSet[dd], delimiter=",")
+                        # np.save("P_"+str(dd)+".npy", QSet[dd])
+                        # np.save("A_"+str(dd)+".npy", AeqSet[dd])
+                        # np.save("B_"+str(dd)+".npy", BeqSet[dd])
+                        # print(time.time()-t2)
+                    Phat_ = result
+                    if Phat_ is not None:
+                        flag_ = True
+                    else:
+                        flag_ = False
                 except:
                     Phat_ = None
                     flag_ = False
             else: # using end-derivative method
                 if ASet is not None:
-                    ## qpoases version
-                    qp = {}
-                    qp['h'] = ca.DM(QSet[dd]).sparsity()
-                    qp['a'] = ca.DM(ASet[dd]).sparsity()
+                    # result = solve_qp(P=QSet[dd], q=HSet[dd], G=ASet[dd],
+                        # h=BSet[dd], solver='cvxopt')
+                    # dP_ = result.reshape(-1, 1)
+                    t1 = time.time()
+                    result = self.qp_mk_solver(P=QSet[dd], q=HSet[dd], G=ASet[dd], h=BSet[dd])
+                    print(time.time()-t1)
+                    dP_ = np.array(result).reshape(-1, 1)
+                    dF_ = BeqSet[dd]
+                    Phat_ = solve(mapMat, np.concatenate((dF_, dP_)))
 
-                    options_ = {'print_time':False, "jit":True, 'verbose':False, 'print_problem':False,}
-                    solver_ = ca.conic('solver_', 'qpoases', qp, options_)
-                    try:
-                        result = solver_(h=QSet[dd], g=HSet[dd], a=ASet[dd], uba=BSet[dd])
-                        dP_ = result['x']
-                        dF_ = BeqSet[dd]
-                        Phat_ = solve(mapMat, np.concatenate((dF_, dP_)))
-
-                        flag_ = True
-                    except:
-                        dP_ = None
-                        flag_ = False
+                    flag_ = True
                 else:
                     # without considering the optimization problem, get the result directly
                     dP_ = dp_e.copy()
                     dF_ = BeqSet[dd]
                     Phat_ = solve(mapMat, np.concatenate((dF_, dP_[dd].reshape(-1, 1))))
                     flag_ = True
-
                 # ## ipopt version [this is an alternative choice to solve the opt problem, however it is slower than the sigle qp problem]
+                # t3 = time.time()
                 # x_sym = ca.SX.sym('x', QSet[0].shape[0])
                 # opts_setting = {'ipopt.max_iter':100, 'ipopt.print_level':0, 'print_time':0, 'ipopt.acceptable_tol':1e-8, 'ipopt.acceptable_obj_change_tol':1e-6}
-                # print(HSet[dd].shape)
                 # obj = 0.5* ca.mtimes([x_sym.T, QSet[dd], x_sym]) + ca.mtimes([HSet[dd].reshape(1, -1), x_sym])
                 # Ax_sym = ca.mtimes([ASet[dd], x_sym])
                 # nlp_prob = {'f': obj, 'x': x_sym, 'g':Ax_sym}
@@ -403,6 +550,16 @@ class PolyTrajGen(TrajGen):
                 # except:
                 #     dP_ = None
                 #     flag_ = False
+                # print(time.time() - t3)
+                # except:
+                #     dP_ = None
+                #     flag_ = False
+                # else:
+                #     # without considering the optimization problem, get the result directly
+                #     dP_ = dp_e.copy()
+                #     dF_ = BeqSet[dd]
+                #     Phat_ = solve(mapMat, np.concatenate((dF_, dP_[dd].reshape(-1, 1))))
+                #     flag_ = True
             if flag_:
                 print("success !")
                 # print('phat shape: {}'.format(Phat_.shape))
